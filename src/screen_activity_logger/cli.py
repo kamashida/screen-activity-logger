@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 from screen_activity_logger.application.use_cases import (
@@ -86,6 +89,7 @@ def build_use_case(
     vlm_backend: str = "ollama",
     vlm_url: str = DEFAULT_VLLM_URL,
     speech_summary: bool = False,
+    vlm_api_key: str | None = None,
 ) -> GenerateWorklog:
     """設定値から全アダプタを組み立てたユースケースを返す。
 
@@ -102,7 +106,7 @@ def build_use_case(
         text_recognizer=PaddleOcrRecognizer(tier=ocr_tier),
         scene_describer=create_describer(
             vlm_backend, model, timeout_seconds=vlm_timeout_seconds,
-            base_url=vlm_url,
+            base_url=vlm_url, api_key=vlm_api_key,
         ),
         merger=TimelineMerger(ocr_match_tolerance_seconds=ocr_tolerance_seconds),
         frame_comparator=PilFrameComparator(threshold=diff_threshold),
@@ -123,7 +127,7 @@ def build_use_case(
         speech_summarizer=(
             create_summarizer(
                 vlm_backend, model, base_url=vlm_url,
-                timeout_seconds=vlm_timeout_seconds,
+                timeout_seconds=vlm_timeout_seconds, api_key=vlm_api_key,
             )
             if speech_summary
             else None
@@ -212,6 +216,13 @@ def main(argv: list[str] | None = None) -> int:
         help="VLM呼び出しの試行毎タイムアウト秒（タイムアウト時は1回リトライ、既定: 300）",
     )
     parser.add_argument(
+        "--vlm-api-key-env", default=None,
+        help="クラウドVLM（Gemini/Anthropic互換エンドポイント等）認証用のAPIキーを"
+        "保持する環境変数名。指定時はその環境変数の値をAuthorization: Bearerヘッダ"
+        "として送信する（キー自体をCLI引数で渡す方式はプロセス一覧への漏洩リスク"
+        "があるため未サポート。既定: 未指定＝ヘッダなし、ローカルVLM向け）",
+    )
+    parser.add_argument(
         "--format", choices=["worklog", "manual"], default="worklog",
         dest="output_format",
         help="出力形式（manual: ステップ構造の手順書manual.md。screencast録画向け。"
@@ -281,8 +292,28 @@ def main(argv: list[str] | None = None) -> int:
                 f"{binary} が見つかりません。README「動作要件」に従い導入してください"
             )
 
+    # クラウドVLM用APIキー解決（値自体はCLI引数で受け取らずプロセス一覧への
+    # 漏洩を防ぐ。環境変数が未設定・空ならサイレント無認証にせず即エラー）
+    vlm_api_key: str | None = None
+    if args.vlm_api_key_env:
+        vlm_api_key = os.environ.get(args.vlm_api_key_env)
+        if not vlm_api_key:
+            parser.error(
+                f"環境変数 {args.vlm_api_key_env} が未設定または空です。"
+                " --vlm-api-key-env で指定した環境変数にAPIキーを設定してください"
+            )
+
+    # ローカル以外への接続はフレーム画像（画面キャプチャ）が外部送信される
+    # ため、実行開始時に1回だけ明示警告する（api_keyの有無に関わらず対象）
+    vlm_host = urllib.parse.urlsplit(args.vlm_url).hostname or args.vlm_url
+    if vlm_host not in ("localhost", "127.0.0.1"):
+        print(
+            f"警告: VLM接続先が外部です（{vlm_host}）。フレーム画像が外部に送信されます",
+            file=sys.stderr,
+        )
+
     try:
-        ensure_vlm_available(args.vlm_backend, args.vlm_url)
+        ensure_vlm_available(args.vlm_backend, args.vlm_url, api_key=vlm_api_key)
     except ValueError as exc:
         parser.error(str(exc))
     asr_backend = resolve_backend(args.asr_backend)
@@ -328,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
             vlm_timeout_seconds=args.vlm_timeout,
             vlm_backend=args.vlm_backend,
             vlm_url=args.vlm_url,
+            vlm_api_key=vlm_api_key,
             speech_summary=args.speech_summary,
             # バッチは動画毎サブディレクトリ配下に frames/ を置くため単発のみここで指定
             frame_export_dir=(

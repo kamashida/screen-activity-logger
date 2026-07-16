@@ -20,6 +20,7 @@ from screen_activity_logger.infrastructure.openai_chat_describer import (
 )
 from screen_activity_logger.infrastructure.vlm_common import (
     DEFAULT_TIMEOUT_SECONDS,
+    build_auth_headers,
 )
 
 VLM_BACKENDS = ("ollama", "vllm-mlx")
@@ -30,11 +31,13 @@ def create_describer(
     model: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     base_url: str = DEFAULT_VLLM_URL,
+    api_key: str | None = None,
 ) -> SceneDescriber:
     """解決済みバックエンドからSceneDescriberを生成する。
 
     vllm-mlx時はmodelがOllama形式（qwen3-vl:8b）ならMLX既定モデルに読み替える
     （タグ形式はOllama固有のため）。
+    api_key: クラウド互換エンドポイント向けAuthorizationヘッダ用（未指定ならヘッダなし）。
     """
     if backend == "ollama":
         return OllamaSceneDescriber(model=model, timeout_seconds=timeout_seconds)
@@ -43,11 +46,16 @@ def create_describer(
             model=_resolve_vllm_model(model),
             base_url=base_url,
             timeout_seconds=timeout_seconds,
+            api_key=api_key,
         )
     raise ValueError(f"未知のVLMバックエンド: {backend}")
 
 
-def ensure_backend_available(backend: str, base_url: str = DEFAULT_VLLM_URL) -> None:
+def ensure_backend_available(
+    backend: str,
+    base_url: str = DEFAULT_VLLM_URL,
+    api_key: str | None = None,
+) -> None:
     """VLMサーバーの到達性チェック（重い処理の前に親切なエラーで止める）。"""
     if backend == "ollama":
         # 重いOCRの後で初めて未起動に気づかないよう起動前に確認（4AIレビューR1）
@@ -64,9 +72,19 @@ def ensure_backend_available(backend: str, base_url: str = DEFAULT_VLLM_URL) -> 
         return
     import httpx
 
+    headers = build_auth_headers(api_key)
     try:
-        response = httpx.get(f"{base_url.rstrip('/')}/models", timeout=5.0)
-        response.raise_for_status()
+        kwargs: dict = {"timeout": 5.0}
+        if headers:
+            kwargs["headers"] = headers
+        response = httpx.get(f"{base_url.rstrip('/')}/models", **kwargs)
+        if api_key:
+            # クラウド互換エンドポイントは/modelsが404等の非200を返す場合がある
+            # ため、認証キー付きのときは401/403（認証エラー）のみ失敗扱いにする
+            if response.status_code in (401, 403):
+                response.raise_for_status()
+        else:
+            response.raise_for_status()
     except Exception as error:  # noqa: BLE001
         raise ValueError(
             f"vllm-mlxサーバーに接続できません（{base_url}）: {type(error).__name__}。"
@@ -81,18 +99,23 @@ def create_summarizer(
     model: str,
     base_url: str = DEFAULT_VLLM_URL,
     timeout_seconds: float | None = None,
+    api_key: str | None = None,
 ) -> SpeechSummarizer:
     """VLMと同一バックエンド・モデルで発話要旨アダプタを生成する（Issue #23）。
 
     モデル名の読み替え規則はcreate_describerと同一（挙動差の排除）。
     timeout_seconds未指定時はアダプタ既定（60s）。
+    api_key: クラウド互換エンドポイント向けAuthorizationヘッダ用（未指定ならヘッダなし）。
     """
     kwargs = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
     if backend == "ollama":
         return OllamaChatSummarizer(model=model, **kwargs)
     if backend == "vllm-mlx":
         return OpenAIChatSummarizer(
-            model=_resolve_vllm_model(model), base_url=base_url, **kwargs
+            model=_resolve_vllm_model(model),
+            base_url=base_url,
+            api_key=api_key,
+            **kwargs,
         )
     raise ValueError(f"未知のVLMバックエンド: {backend}")
 

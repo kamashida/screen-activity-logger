@@ -95,6 +95,54 @@ class TestEnsureBackendAvailable:
         monkeypatch.setattr("httpx.get", lambda url, timeout=None: OkResponse())
         ensure_backend_available("vllm-mlx")
 
+    def test_api_key_adds_authorization_header(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        class OkResponse:
+            status_code = 200
+
+            def raise_for_status(self): ...
+
+        def fake_get(url, timeout=None, headers=None):
+            calls.append({"headers": headers})
+            return OkResponse()
+
+        monkeypatch.setattr("httpx.get", fake_get)
+        ensure_backend_available("vllm-mlx", api_key="secret-key")
+
+        (call,) = calls
+        assert call["headers"] == {"Authorization": "Bearer secret-key"}
+
+    def test_cloud_endpoint_404_is_treated_as_reachable_with_api_key(
+        self, monkeypatch
+    ) -> None:
+        """クラウド互換/modelsは404を返す場合があるため、認証キー付きでは
+        401/403以外は失敗扱いにしない（自社dogfood改造）。"""
+
+        class NotFoundResponse:
+            status_code = 404
+
+            def raise_for_status(self):
+                raise RuntimeError("should not be called")
+
+        monkeypatch.setattr(
+            "httpx.get", lambda url, timeout=None, headers=None: NotFoundResponse()
+        )
+        ensure_backend_available("vllm-mlx", api_key="secret-key")  # 例外なし
+
+    def test_cloud_endpoint_401_raises_with_api_key(self, monkeypatch) -> None:
+        class UnauthorizedResponse:
+            status_code = 401
+
+            def raise_for_status(self):
+                raise RuntimeError("401 Unauthorized")
+
+        monkeypatch.setattr(
+            "httpx.get", lambda url, timeout=None, headers=None: UnauthorizedResponse()
+        )
+        with pytest.raises(ValueError):
+            ensure_backend_available("vllm-mlx", api_key="secret-key")
+
 
 class TestCreateSummarizer:
     def test_ollama_backend(self) -> None:

@@ -291,3 +291,132 @@ class TestVlmBackendWiring:
             workdir=tmp_path,
         )
         assert isinstance(use_case.scene_describer, OllamaSceneDescriber)
+
+    def test_vlm_api_key_is_wired_to_describer(self, tmp_path: Path) -> None:
+        """クラウドVLM対応: vlm_api_keyがdescriber/summarizerの認証ヘッダに届く。"""
+        use_case = build_use_case(
+            fps=0.5,
+            scene_threshold=0.08,
+            model="qwen3-vl:8b",
+            ocr_tolerance_seconds=2.0,
+            workdir=tmp_path,
+            vlm_backend="vllm-mlx",
+            vlm_url="http://localhost:9000/v1",
+            vlm_api_key="secret-key",
+        )
+        assert use_case.scene_describer._headers == {
+            "Authorization": "Bearer secret-key"
+        }
+
+    def test_no_vlm_api_key_means_no_headers(self, tmp_path: Path) -> None:
+        use_case = build_use_case(
+            fps=0.5,
+            scene_threshold=0.08,
+            model="qwen3-vl:8b",
+            ocr_tolerance_seconds=2.0,
+            workdir=tmp_path,
+            vlm_backend="vllm-mlx",
+            vlm_url="http://localhost:9000/v1",
+        )
+        assert use_case.scene_describer._headers is None
+
+
+class TestVlmApiKeyCliWiring:
+    """自社dogfood改造: --vlm-api-key-env / 外部URL警告のCLI組み立て検証。
+
+    main()の重い動画処理には踏み込まず、ensure_vlm_availableをフックして
+    引数検証・警告出力までの配線だけを検証する（ダミー動画ファイル使用）。
+    """
+
+    def _video(self, tmp_path: Path) -> Path:
+        video = tmp_path / "in.mp4"
+        video.write_bytes(b"0")
+        return video
+
+    def test_missing_env_var_errors(self, tmp_path: Path, capsys) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-api-key-env", "SAL_TEST_UNSET_KEY_XYZ",
+            ])
+        assert "SAL_TEST_UNSET_KEY_XYZ" in capsys.readouterr().err
+
+    def test_empty_env_var_errors(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        monkeypatch.setenv("SAL_TEST_EMPTY_KEY_XYZ", "")
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-api-key-env", "SAL_TEST_EMPTY_KEY_XYZ",
+            ])
+        assert "SAL_TEST_EMPTY_KEY_XYZ" in capsys.readouterr().err
+
+    def test_present_env_var_is_passed_to_ensure_vlm_available(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        monkeypatch.setenv("SAL_TEST_KEY_XYZ", "secret123")
+        captured: dict = {}
+
+        def fake_ensure(backend, url, api_key=None):
+            captured["api_key"] = api_key
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([
+                str(self._video(tmp_path)),
+                "--vlm-api-key-env", "SAL_TEST_KEY_XYZ",
+            ])
+        assert captured["api_key"] == "secret123"
+
+    def test_external_vlm_url_prints_warning(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        def fake_ensure(backend, url, api_key=None):
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([
+                str(self._video(tmp_path)),
+                "--vlm-backend", "vllm-mlx",
+                "--vlm-url", "https://generativelanguage.googleapis.com/v1beta/openai",
+            ])
+        err = capsys.readouterr().err
+        assert "警告: VLM接続先が外部です" in err
+        assert "generativelanguage.googleapis.com" in err
+
+    def test_localhost_vlm_url_prints_no_warning(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        def fake_ensure(backend, url, api_key=None):
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([str(self._video(tmp_path))])
+        assert "警告" not in capsys.readouterr().err

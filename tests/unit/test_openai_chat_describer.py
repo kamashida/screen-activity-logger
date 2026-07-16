@@ -38,8 +38,8 @@ def _ocr(*lines: str) -> OcrText:
 def _install_fake_post(monkeypatch, handler):
     calls: list[dict] = []
 
-    def fake_post(url, json=None, timeout=None):
-        calls.append({"url": url, "json": json, "timeout": timeout})
+    def fake_post(url, json=None, timeout=None, headers=None):
+        calls.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
         return handler(len(calls))
 
     monkeypatch.setattr("httpx.post", fake_post)
@@ -151,3 +151,28 @@ class TestWarmupAndEmptyRetry:
 
         assert len(calls) == 3  # warmup→空→リトライ成功
         assert desc.action == "編集中"
+
+
+class TestApiKeyAuth:
+    """クラウドVLM対応: Authorizationヘッダの付与（自社dogfood改造）。"""
+
+    _OK = '{"app_guess": "Excel", "resource": null, "location": null, "focus": null, "action": "編集中"}'
+
+    def test_api_key_adds_authorization_header(self, monkeypatch, tmp_path) -> None:
+        calls = _install_fake_post(monkeypatch, lambda n: FakeResponse(self._OK))
+        describer = OpenAIChatSceneDescriber(api_key="secret-key")
+
+        describer.describe(_frame(tmp_path), _ocr())
+
+        # calls[0]はウォームアップ、calls[1]が本処理。両方にヘッダが付く
+        for call in calls:
+            assert call["headers"] == {"Authorization": "Bearer secret-key"}
+
+    def test_no_api_key_sends_no_headers(self, monkeypatch, tmp_path) -> None:
+        calls = _install_fake_post(monkeypatch, lambda n: FakeResponse(self._OK))
+        describer = OpenAIChatSceneDescriber()
+
+        describer.describe(_frame(tmp_path), _ocr())
+
+        for call in calls:
+            assert call["headers"] is None

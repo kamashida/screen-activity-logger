@@ -45,6 +45,32 @@ class TestOpenAIChatSummarizer:
 
         assert OpenAIChatSummarizer(model="m").summarize(("あ",)) is None
 
+    def test_api_key_adds_authorization_header(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        def fake_post(url, json=None, timeout=None, headers=None):
+            calls.append({"headers": headers})
+            return FakeResponse("要旨")
+
+        monkeypatch.setattr("httpx.post", fake_post)
+        OpenAIChatSummarizer(model="m", api_key="secret-key").summarize(("あ",))
+
+        (call,) = calls
+        assert call["headers"] == {"Authorization": "Bearer secret-key"}
+
+    def test_no_api_key_sends_no_headers(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        def fake_post(url, json=None, timeout=None, headers=None):
+            calls.append({"headers": headers})
+            return FakeResponse("要旨")
+
+        monkeypatch.setattr("httpx.post", fake_post)
+        OpenAIChatSummarizer(model="m").summarize(("あ",))
+
+        (call,) = calls
+        assert call["headers"] is None
+
 
 class TestOllamaChatSummarizer:
     def test_uses_ollama_chat(self, monkeypatch) -> None:

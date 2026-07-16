@@ -114,6 +114,15 @@ def normalize_json_value(value: object) -> str | None:
     return stripped
 
 
+def build_auth_headers(api_key: str | None) -> dict[str, str] | None:
+    """APIキーからAuthorizationヘッダを構築する（クラウドVLM対応）。
+
+    api_key未指定（None/空文字）ならNoneを返す＝ヘッダを一切付けない
+    （既存のローカルVLM無認証動作を不変に保つ）。
+    """
+    return {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+
 def is_retryable(error: BaseException) -> bool:
     """タイムアウト系例外か（Issue #15のリトライ対象判定）。
 

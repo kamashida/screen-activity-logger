@@ -172,6 +172,48 @@ class TestEnsureBackendAvailable:
         with pytest.raises(ValueError):
             ensure_backend_available("vllm-mlx", api_key="secret-key")
 
+    def _gemini_preflight(self, monkeypatch, status_code: int) -> None:
+        """指定ステータスを返すモックでgemini事前チェックを実行するヘルパー。"""
+        import httpx
+
+        class FakeResponse:
+            def __init__(self, code: int) -> None:
+                self.status_code = code
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None, headers=None: FakeResponse(status_code),
+        )
+        from screen_activity_logger.infrastructure.vlm_factory import (
+            ensure_provider_available,
+        )
+
+        ensure_provider_available(
+            "ollama", "https://example.com/v1/openapi", "secret-key",
+            provider="gemini", model="google/gemini-2.5-flash", allow_external=True,
+        )
+
+    def test_gemini_preflight_allows_404_model_info(self, monkeypatch) -> None:
+        # Vertex AI openapiエンドポイントは/models/<model>未実装で404を返すが
+        # chat/completionsは動くため、404だけは本呼び出しに委ねる
+        self._gemini_preflight(monkeypatch, 404)  # 例外が出ないこと
+
+    def test_gemini_preflight_rejects_500(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 500)
+
+    def test_gemini_preflight_rejects_429(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 429)
+
+    def test_gemini_preflight_rejects_401(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 401)
+
     def test_anthropic_preflight_does_not_make_models_request(self, monkeypatch) -> None:
         def fail_get(*args, **kwargs):
             raise AssertionError("Anthropic preflight must not call /models")

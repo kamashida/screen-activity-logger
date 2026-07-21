@@ -155,8 +155,9 @@ def ensure_provider_available(
         )
         # OpenAI互換層でもモデル情報エンドポイント自体は未実装のことがある
         # （例: Vertex AIのopenapiエンドポイントは404を返すがchat/completionsは動く）。
-        # 認証失敗（401/403）だけを致命扱いにし、404等は本呼び出しに委ねる。
-        if response.status_code in (401, 403):
+        # 許容は404のみ。認証失敗（401/403）やサーバー障害・レート制限
+        # （500/429等）は事前に止める（Codexレビュー指摘）。
+        if response.status_code != 404:
             response.raise_for_status()
     except Exception as error:  # noqa: BLE001
         raise ValueError(

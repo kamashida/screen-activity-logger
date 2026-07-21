@@ -7,8 +7,13 @@ from screen_activity_logger.application.ports import (
     SpeechSummarizer,
 )
 from screen_activity_logger.infrastructure.chat_summarizer import (
+    AnthropicChatSummarizer,
     OllamaChatSummarizer,
     OpenAIChatSummarizer,
+)
+from screen_activity_logger.infrastructure.anthropic_messages_describer import (
+    DEFAULT_ANTHROPIC_URL,
+    AnthropicMessagesSceneDescriber,
 )
 from screen_activity_logger.infrastructure.ollama_describer import (
     OllamaSceneDescriber,
@@ -21,30 +26,51 @@ from screen_activity_logger.infrastructure.openai_chat_describer import (
 from screen_activity_logger.infrastructure.vlm_common import (
     DEFAULT_TIMEOUT_SECONDS,
     build_auth_headers,
+    validate_vlm_url,
 )
 
 VLM_BACKENDS = ("ollama", "vllm-mlx")
+VLM_PROVIDERS = ("local", "gemini", "anthropic")
+DEFAULT_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
 def create_describer(
     backend: str,
     model: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-    base_url: str = DEFAULT_VLLM_URL,
+    base_url: str | None = None,
     api_key: str | None = None,
+    provider: str = "local",
 ) -> SceneDescriber:
     """解決済みバックエンドからSceneDescriberを生成する。
 
     vllm-mlx時はmodelがOllama形式（qwen3-vl:8b）ならMLX既定モデルに読み替える
     （タグ形式はOllama固有のため）。
-    api_key: クラウド互換エンドポイント向けAuthorizationヘッダ用（未指定ならヘッダなし）。
+    provider: local / gemini / anthropic。クラウドはプロバイダ固有の形式を使う。
     """
+    if provider == "gemini":
+        return OpenAIChatSceneDescriber(
+            model=model,
+            base_url=base_url or DEFAULT_GEMINI_URL,
+            timeout_seconds=timeout_seconds,
+            api_key=api_key,
+            warmup=False,  # クラウドでウォームアップ課金を発生させない
+        )
+    if provider == "anthropic":
+        return AnthropicMessagesSceneDescriber(
+            model=model,
+            base_url=base_url or DEFAULT_ANTHROPIC_URL,
+            timeout_seconds=timeout_seconds,
+            api_key=api_key,
+        )
+    if provider != "local":
+        raise ValueError(f"未知のVLMプロバイダ: {provider}")
     if backend == "ollama":
         return OllamaSceneDescriber(model=model, timeout_seconds=timeout_seconds)
     if backend == "vllm-mlx":
         return OpenAIChatSceneDescriber(
             model=_resolve_vllm_model(model),
-            base_url=base_url,
+            base_url=base_url or DEFAULT_VLLM_URL,
             timeout_seconds=timeout_seconds,
             api_key=api_key,
         )
@@ -78,12 +104,7 @@ def ensure_backend_available(
         if headers:
             kwargs["headers"] = headers
         response = httpx.get(f"{base_url.rstrip('/')}/models", **kwargs)
-        if api_key:
-            # クラウド互換エンドポイントは/modelsが404等の非200を返す場合がある
-            # ため、認証キー付きのときは401/403（認証エラー）のみ失敗扱いにする
-            if response.status_code in (401, 403):
-                response.raise_for_status()
-        else:
+        if not 200 <= response.status_code < 300:
             response.raise_for_status()
     except Exception as error:  # noqa: BLE001
         raise ValueError(
@@ -94,12 +115,63 @@ def ensure_backend_available(
         ) from error
 
 
+def ensure_provider_available(
+    backend: str,
+    base_url: str,
+    api_key: str | None = None,
+    *,
+    provider: str = "local",
+    model: str | None = None,
+    allow_external: bool = False,
+) -> None:
+    """選択プロバイダの事前確認。
+
+    GeminiはOpenAI互換のモデル取得を確認する。Anthropicはモデル一覧APIを
+    持たず、無駄な課金リクエストを避けるため、キーとURLの検証だけを行う。
+    """
+    # CLI以外から呼ばれても、クラウド・カスタムVLMへの送信境界を同じにする。
+    validate_vlm_url(base_url, allow_external=allow_external)
+    if provider == "local":
+        ensure_backend_available(backend, base_url, api_key=api_key)
+        return
+    if provider not in VLM_PROVIDERS:
+        raise ValueError(f"未知のVLMプロバイダ: {provider}")
+    if not api_key:
+        raise ValueError(f"{provider}のAPIキーが設定されていません")
+    if not model:
+        raise ValueError(f"{provider}では--modelの明示指定が必要です")
+    if provider == "anthropic":
+        return
+
+    import httpx
+    from urllib.parse import quote
+
+    headers = build_auth_headers(api_key)
+    try:
+        response = httpx.get(
+            f"{base_url.rstrip('/')}/models/{quote(model, safe='')}",
+            headers=headers,
+            timeout=5.0,
+        )
+        # OpenAI互換層でもモデル情報エンドポイント自体は未実装のことがある
+        # （例: Vertex AIのopenapiエンドポイントは404を返すがchat/completionsは動く）。
+        # 認証失敗（401/403）だけを致命扱いにし、404等は本呼び出しに委ねる。
+        if response.status_code in (401, 403):
+            response.raise_for_status()
+    except Exception as error:  # noqa: BLE001
+        raise ValueError(
+            f"{provider}のモデルに接続できません（{base_url} / {model}）: "
+            f"{type(error).__name__}"
+        ) from error
+
+
 def create_summarizer(
     backend: str,
     model: str,
-    base_url: str = DEFAULT_VLLM_URL,
+    base_url: str | None = None,
     timeout_seconds: float | None = None,
     api_key: str | None = None,
+    provider: str = "local",
 ) -> SpeechSummarizer:
     """VLMと同一バックエンド・モデルで発話要旨アダプタを生成する（Issue #23）。
 
@@ -108,12 +180,24 @@ def create_summarizer(
     api_key: クラウド互換エンドポイント向けAuthorizationヘッダ用（未指定ならヘッダなし）。
     """
     kwargs = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
+    if provider == "gemini":
+        return OpenAIChatSummarizer(
+            model=model, base_url=base_url or DEFAULT_GEMINI_URL,
+            api_key=api_key, **kwargs
+        )
+    if provider == "anthropic":
+        return AnthropicChatSummarizer(
+            model=model, base_url=base_url or DEFAULT_ANTHROPIC_URL,
+            api_key=api_key, **kwargs
+        )
+    if provider != "local":
+        raise ValueError(f"未知のVLMプロバイダ: {provider}")
     if backend == "ollama":
         return OllamaChatSummarizer(model=model, **kwargs)
     if backend == "vllm-mlx":
         return OpenAIChatSummarizer(
             model=_resolve_vllm_model(model),
-            base_url=base_url,
+            base_url=base_url or DEFAULT_VLLM_URL,
             api_key=api_key,
             **kwargs,
         )

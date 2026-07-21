@@ -42,11 +42,13 @@ class OpenAIChatSceneDescriber:
         base_url: str = DEFAULT_VLLM_URL,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         api_key: str | None = None,
+        warmup: bool = True,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._warmed = False
+        self._warmup_enabled = warmup
         # クラウド互換エンドポイント（Gemini/Anthropic互換層）向け認証ヘッダ。
         # 未指定なら既存のヘッダなし動作を維持する
         self._headers = build_auth_headers(api_key)
@@ -54,7 +56,8 @@ class OpenAIChatSceneDescriber:
     def describe(
         self, frame: Frame, ocr: OcrText, speech: tuple[str, ...] = ()
     ) -> ActivityDescription:
-        self._ensure_warm()
+        if self._warmup_enabled:
+            self._ensure_warm()
         image_b64 = base64.b64encode(Path(frame.path).read_bytes()).decode()
         payload = {
             "model": self._model,

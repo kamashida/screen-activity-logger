@@ -32,3 +32,11 @@ class TestOcrTier:
     def test_lang_is_always_included(self) -> None:
         recognizer = PaddleOcrRecognizer(tier="tiny")
         assert recognizer._engine_kwargs()["lang"] == "japan"
+
+    def test_windows_disables_onednn_for_paddle_cpu_stability(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "screen_activity_logger.infrastructure.paddle_ocr.platform.system",
+            lambda: "Windows",
+        )
+        recognizer = PaddleOcrRecognizer(tier="small")
+        assert recognizer._engine_kwargs()["enable_mkldnn"] is False

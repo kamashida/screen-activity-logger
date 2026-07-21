@@ -2,6 +2,7 @@
 
 from screen_activity_logger.infrastructure.chat_summarizer import (
     SUMMARY_PROMPT,
+    AnthropicChatSummarizer,
     OllamaChatSummarizer,
     OpenAIChatSummarizer,
 )
@@ -103,3 +104,44 @@ class TestOllamaChatSummarizer:
         assert result == "要旨文"
         assert calls_meta == [60.0]  # 無限待ち防止のtimeout（4AIレビューR1）
         assert call["think"] is False  # thinking無効（describerと対称、4AIレビューR2）
+
+
+class TestAnthropicChatSummarizer:
+    def test_uses_messages_api_and_anthropic_headers(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        def fake_post(url, json=None, timeout=None, headers=None):
+            calls.append(
+                {"url": url, "json": json, "timeout": timeout, "headers": headers}
+            )
+            return type(
+                "FakeResponse",
+                (),
+                {
+                    "raise_for_status": lambda self: None,
+                    "json": lambda self: {
+                        "content": [
+                            {"type": "text", "text": "  発話の要旨  "},
+                        ]
+                    },
+                },
+            )()
+
+        monkeypatch.setattr("httpx.post", fake_post)
+        summarizer = AnthropicChatSummarizer(
+            model="claude-test",
+            base_url="https://api.anthropic.com/v1",
+            api_key="secret-key",
+            timeout_seconds=45.0,
+        )
+
+        result = summarizer.summarize(("進捗です", "来週完了"))
+
+        (call,) = calls
+        assert call["url"] == "https://api.anthropic.com/v1/messages"
+        assert call["headers"]["x-api-key"] == "secret-key"
+        assert call["headers"]["anthropic-version"] == "2023-06-01"
+        assert SUMMARY_PROMPT in call["json"]["messages"][0]["content"]
+        assert call["json"]["max_tokens"] == 100
+        assert call["timeout"] == 45.0
+        assert result == "発話の要旨"

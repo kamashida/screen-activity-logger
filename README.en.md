@@ -1,8 +1,8 @@
 # screen-activity-logger
 
-Turn screen recordings (MP4) into **structured, timestamped work logs — fully local**. Three contexts are extracted and merged: ① on-screen text (OCR), ② what the user is doing described by a VLM, and ③ speech (ASR).
+Turn screen recordings (MP4) into **structured, timestamped work logs — local by default**. Three contexts are extracted and merged: ① on-screen text (OCR), ② what the user is doing described by a VLM, and ③ speech (ASR). Gemini and Anthropic are available only with explicit external-send approval.
 
-> Nothing is sent to any cloud API. Meeting recordings, confidential screens, and client-environment captures can all be processed safely.
+> Local VLM runs do not send data to cloud APIs. Cloud VLM runs send frames externally, so check permission, retention, and contract requirements before using confidential or client recordings.
 
 *日本語版: [README.md](./README.md)*
 
@@ -37,7 +37,7 @@ Editing a unit-price cell                            ← action (Qwen3-VL)
 
 ```bash
 uv venv -p 3.12 .venv
-uv pip install -e . && uv pip install -e ".[dev]" && uv pip install -e ".[asr]"
+uv sync --locked --extra dev --extra asr
 ollama pull qwen3-vl:8b
 
 .venv/bin/python -m screen_activity_logger.cli recording.mp4 -o out/
@@ -53,8 +53,28 @@ winget install Gyan.FFmpeg
 ollama pull qwen3-vl:8b
 
 uv venv -p 3.12 .venv
-uv pip install -e . ; uv pip install -e ".[dev]" ; uv pip install -e ".[asr-faster]"
+uv sync --locked --extra dev --extra asr-faster
 uv run python -m screen_activity_logger.cli recording.mp4 -o out/
+```
+
+### Cloud VLM (explicit opt-in)
+
+Cloud providers require an explicit model, an API-key environment variable, HTTPS, and
+`--allow-external-vlm`. The key value is never passed as a CLI argument.
+
+Use `--no-vlm` explicitly to run an OCR/ASR baseline without contacting any VLM.
+This validates extraction and output wiring, but is not a replacement for VLM scene understanding.
+
+```powershell
+$env:GEMINI_API_KEY = "your-key"
+uv run screen-activity-logger recording.mp4 --no-asr `
+  --vlm-provider gemini --model <gemini-model> `
+  --vlm-api-key-env GEMINI_API_KEY --allow-external-vlm -o out/
+
+$env:ANTHROPIC_API_KEY = "your-key"
+uv run screen-activity-logger recording.mp4 --no-asr `
+  --vlm-provider anthropic --model <claude-model> `
+  --vlm-api-key-env ANTHROPIC_API_KEY --allow-external-vlm -o out/
 ```
 
 On macOS install whisper.cpp for the fast ASR path (`brew install whisper-cpp` plus a kotoba-whisper
@@ -126,13 +146,13 @@ Measured on M4 Air 24GB: a 5-minute meeting clip completes in **~63 seconds** (v
 
 ## Requirements
 
-- Python 3.12, ffmpeg, Ollama ≥ 0.30 (qwen3-vl:8b) or vllm-mlx
+- Python 3.12, ffmpeg, and Ollama ≥ 0.30 (qwen3-vl:8b) or vllm-mlx for local VLM. Gemini/Anthropic require an API key and explicit external-send approval.
 - macOS (Apple Silicon), Windows, or Linux
 - **~16GB RAM recommended** (the 4-bit 8B VLM uses 6–8GB during inference; developed on 24GB)
 
 ### First-run model downloads (~8GB total, one-time, free)
 
-All inference runs locally, so models must be fetched once (offline afterwards, no API fees):
+For the local provider, inference runs locally, so models must be fetched once (offline afterwards, no API fees):
 
 | Model | Role | Size | How |
 |---|---|---|---|
@@ -145,7 +165,7 @@ For low-spec machines, **Qwen3-VL 4B (~3GB, 1.7x faster, comparable quality on m
 
 ## Privacy
 
-Screen recordings may contain passwords and personal data. This tool runs fully locally, and recordings/outputs are excluded from the repository via `.gitignore`. Consider encrypting your output storage.
+Screen recordings may contain passwords and personal data. Local-provider recordings/outputs are excluded from the repository via `.gitignore`. Cloud-provider runs transmit frames to the selected provider; verify permission and retention settings, and consider encrypting output storage.
 
 ## License
 

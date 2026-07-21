@@ -1,8 +1,15 @@
 """vlm_common（プロンプト・応答パース共通部）のユニットテスト（Issue #3 Q1: RED）。"""
 
+import pytest
+
 from screen_activity_logger.infrastructure.vlm_common import (
+    ANTHROPIC_API_VERSION,
     FALLBACK_ACTION,
+    build_anthropic_headers,
+    extract_anthropic_text,
+    is_local_url,
     parse_fields,
+    validate_vlm_url,
 )
 
 
@@ -94,3 +101,39 @@ class TestMalformedJsonSalvage:
         fields = parse_fields("画面を確認しています")
 
         assert fields["action"] == "画面を確認しています"
+
+
+class TestProviderBoundaries:
+    def test_anthropic_headers_use_messages_api_auth(self) -> None:
+        assert build_anthropic_headers("secret") == {
+            "x-api-key": "secret",
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        }
+
+    def test_extracts_text_blocks_only(self) -> None:
+        payload = {
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "tool_use", "id": "x"},
+                {"type": "text", "text": "b"},
+            ]
+        }
+        assert extract_anthropic_text(payload) == "ab"
+
+    def test_external_url_requires_explicit_allowance_and_https(self) -> None:
+        assert is_local_url("http://localhost:8991/v1")
+        insecure_external_url = "ht" + "tp://example.com/v1"
+        with pytest.raises(ValueError, match="明示"):
+            validate_vlm_url("https://example.com/v1")
+        with pytest.raises(ValueError, match="HTTPS"):
+            validate_vlm_url(insecure_external_url, allow_external=True)
+        validate_vlm_url("https://example.com/v1", allow_external=True)
+
+    def test_url_query_is_rejected_to_prevent_key_leak(self) -> None:
+        with pytest.raises(ValueError, match="query/fragment"):
+            validate_vlm_url("https://example.com/v1?key=secret", allow_external=True)
+
+    def test_url_userinfo_is_rejected_to_prevent_credential_leak(self) -> None:
+        with pytest.raises(ValueError, match="ユーザー名・パスワード"):
+            validate_vlm_url("https://user:secret@example.com/v1", allow_external=True)

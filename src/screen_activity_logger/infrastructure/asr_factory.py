@@ -57,6 +57,20 @@ _INSTALL_HINTS = {
 }
 
 
+def _import_mlx_whisper() -> None:
+    import mlx_whisper  # noqa: F401
+
+
+def _import_faster_whisper() -> None:
+    import faster_whisper  # noqa: F401
+
+
+_BACKEND_IMPORTERS = {
+    "mlx": _import_mlx_whisper,
+    "faster": _import_faster_whisper,
+}
+
+
 def is_cpp_available(model_path: Path | None = None) -> bool:
     """whisper.cppが使えるか（バイナリ＋モデルファイルの両方）。"""
     resolved_model = DEFAULT_CPP_ASR_MODEL_PATH if model_path is None else model_path
@@ -112,6 +126,14 @@ def ensure_backend_available(
             f" {_INSTALL_HINTS[backend]} で導入するか、"
             "--no-asr で音声認識を無効化してください"
         )
+    try:
+        _BACKEND_IMPORTERS[backend]()
+    except Exception as error:  # noqa: BLE001 — DLL/ABI不整合も起動前に説明する
+        raise ValueError(
+            f"ASRバックエンド '{backend}' は見つかりましたが読み込めません: "
+            f"{type(error).__name__}: {error}。"
+            " Python/OSに合うwheelへ再構築するか、--no-asrを指定してください"
+        ) from error
 
 
 def _ensure_cpp_available(model_path: Path | None) -> None:

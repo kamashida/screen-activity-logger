@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import platform
 from typing import Any
 
 from screen_activity_logger.domain.models import Frame, OcrText
@@ -46,6 +47,11 @@ class PaddleOcrRecognizer:
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
         }
+        # PaddlePaddle 3.xのWindows CPU版ではoneDNN実行時に
+        # ConvertPirAttribute2RuntimeAttributeが発生する組み合わせがある。
+        # OCRは速度より安定性を優先し、WindowsだけoneDNNを明示的に無効化する。
+        if platform.system() == "Windows":
+            kwargs["enable_mkldnn"] = False
         model_names = _TIER_MODEL_NAMES[self._tier]
         if model_names is not None:
             det_name, rec_name = model_names

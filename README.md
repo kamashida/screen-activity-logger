@@ -1,8 +1,8 @@
 # screen-activity-logger
 
-PC画面を録画した動画（MP4）を入力に、**完全ローカル**で **3つのコンテキスト**──①画面の文字（OCR）②何をしているかの日本語説明（VLM）③発話（ASR）──を抽出・統合し、**構造化されたタイムスタンプ付き日本語作業ログ**を生成するツール。
+PC画面を録画した動画（MP4）を入力に、**デフォルトは完全ローカル**で **3つのコンテキスト**──①画面の文字（OCR）②何をしているかの日本語説明（VLM）③発話（ASR）──を抽出・統合し、**構造化されたタイムスタンプ付き日本語作業ログ**を生成するツール。Gemini / AnthropicのVLMは、外部送信を明示的に許可した場合だけ利用できる。
 
-> クラウドAPIに一切送らない。会議録画・機密画面・顧客環境の録画も安心して処理できる。
+> ローカルVLMを選ぶ限りクラウドAPIには送らない。クラウドVLMを選ぶとフレーム画像が外部送信されるため、機密・顧客データは許可と契約を確認してから使うこと。
 
 *English: [README.en.md](./README.en.md)*
 
@@ -33,7 +33,7 @@ PC画面を録画した動画（MP4）を入力に、**完全ローカル**で *
 |----|------|------|
 | **フレーム抽出** | ffmpeg（fps均等サンプリング＋シーン変化検出、長辺1024px縮小） | 視覚トークン超過の実測に基づく |
 | **OCR層** | PaddleOCR PP-OCRv6 tiny/small/medium（日本語、CPU） | 画面差分によるスキップ＋会議モードでキーフレーム限定 |
-| **VLM層** | Qwen3-VL 8B（Ollama / vllm-mlx。**Apple Siliconはvllm-mlx推奨・実測約40倍** #8） | 構造化5フィールド出力・タイムアウト＋リトライ＋テレメトリ・幻覚resource品質ゲート（#15/#17） |
+| **VLM層** | ローカルQwen3-VL 8B（Ollama / vllm-mlx。**Apple Siliconはvllm-mlx推奨・実測約40倍** #8）または明示オプトインのGemini / Anthropic | 構造化5フィールド出力・タイムアウト＋リトライ＋テレメトリ・幻覚resource品質ゲート（#15/#17）。クラウドはAPIキーを環境変数から読み、起動時に外部送信を警告 |
 | **ASR層** | kotoba-whisper v2.0（Mac: whisper.cpp Metal / Windows・Linux: faster-whisper、自動選択） | 日本語特化・無音幻覚フィルタ（#14）・相槌のみの行をカット（#25、--keep-fillersで無効化）。2時間実測でmlx-whisperは品質崩壊のため非推奨化（#22）。音声なしは自動スキップ |
 | **VLMゲート** | OCRトークンJaccard（meetingモード） | 話者切替のVLM無駄撃ちを抑制（3者設計協議で採択、Issue #13） |
 | **出力** | JSONL（機械用・一次情報保持）＋Markdown（人間用） | |
@@ -51,7 +51,7 @@ PC画面を録画した動画（MP4）を入力に、**完全ローカル**で *
                  │      ├─► ScreenContext抽出（ファイル名・URL・ページ位置＝事実）
                  │      └─► VLMゲート（meetingモード: 文字が変わった時だけVLMへ）
                  │              │
-                 └──────────────┴─► Qwen3-VL（＋OCR/発話をプロンプト同梱）
+                 └──────────────┴─► ローカルQwen3-VL / Gemini / Anthropic（＋OCR/発話をプロンプト同梱）
                                         │
                         Merge: 時刻 | app | resource | 位置 | 👁 | 🗣️ | 動作 | 生OCR
                                         │
@@ -63,7 +63,7 @@ PC画面を録画した動画（MP4）を入力に、**完全ローカル**で *
 ```bash
 # セットアップ（初回のみ）
 uv venv -p 3.12 .venv
-uv pip install -e . && uv pip install -e ".[dev]" && uv pip install -e ".[asr]"
+uv sync --locked --extra dev --extra asr
 ollama pull qwen3-vl:8b
 
 # 実行（単一動画）
@@ -79,7 +79,11 @@ ollama pull qwen3-vl:8b
 #   --save-frames             キーフレーム画像を frames/ に保存しMarkdownに埋め込む（既定OFF）
 #   --fps 0.5                 サンプリング頻度（既定0.5=2秒に1枚）
 #   --scene-threshold 0.08    シーン変化の閾値
-#   --model qwen3-vl:8b       OllamaのVLMモデル
+#   --model qwen3-vl:8b       ローカルVLMモデル（クラウドでは必須）
+#   --vlm-provider local      local / gemini / anthropic（既定: local）
+#   --vlm-api-key-env NAME    クラウドAPIキーを読む環境変数名（キー値は引数に渡さない）
+#   --allow-external-vlm      フレームの外部送信を明示許可（クラウド利用時に必須）
+#   --no-vlm                  VLMなしのOCR/ASR基線（外部送信なし）
 #   --ocr-tier small          OCRモデル規模 tiny/small/medium（既定small）
 #   --diff-threshold 0.02     画面差分によるOCRスキップの閾値
 #   --asr-backend auto        ASRバックエンド auto/cpp/faster/mlx
@@ -98,6 +102,36 @@ ollama pull qwen3-vl:8b
 #   --asr-avg-logprob -1.0    ASR幻覚フィルタ閾値（avg_logprob）
 #   --keep-fillers            相槌のみの発話行（「はい」「えーと」等）を残す（既定はカット）
 #   --no-asr-filter           ASR幻覚フィルタを無効化（デバッグ用。フィラーカットも無効）
+```
+
+### クラウドVLM（明示オプトイン）
+
+外部VLMは既定で拒否する。利用時は、APIキーを環境変数に設定し、モデル名と
+`--allow-external-vlm`を明示する。APIキーの実値をCLI引数に渡さない。
+
+```powershell
+# Gemini（OpenAI互換エンドポイント）
+$env:GEMINI_API_KEY = "キーの実値"
+uv run screen-activity-logger 録画.mp4 --no-asr `
+  --vlm-provider gemini --model <gemini-model> `
+  --vlm-api-key-env GEMINI_API_KEY --allow-external-vlm -o out/
+
+# Anthropic（Messages API）
+$env:ANTHROPIC_API_KEY = "キーの実値"
+uv run screen-activity-logger 録画.mp4 --no-asr `
+  --vlm-provider anthropic --model <claude-model> `
+  --vlm-api-key-env ANTHROPIC_API_KEY --allow-external-vlm -o out/
+```
+
+クラウドVLMでは、VLMの死活確認のためのモデル一覧リクエストもプロバイダ別に制御する。
+Anthropicはモデル一覧APIを叩かず、推論リクエストまで無駄な課金通信を発生させない。
+
+APIキーやVLMサーバーをまだ用意していない場合は、明示的に `--no-vlm` を付けると
+OCR/ASRと出力形式だけを実録画で検証できます。これはVLM品質の代替ではなく、
+外部送信なしの基線ログです。
+
+```powershell
+uv run screen-activity-logger 録画.mp4 --no-vlm --mode meeting -o out/
 ```
 
 ### モードの使い分け
@@ -233,7 +267,7 @@ winget install Gyan.FFmpeg
 ollama pull qwen3-vl:8b
 
 uv venv -p 3.12 .venv
-uv pip install -e . ; uv pip install -e ".[dev]" ; uv pip install -e ".[asr-faster]"
+uv sync --locked --extra dev --extra asr-faster
 # 実行（--asr-backend autoが自動でfasterに解決される）
 uv run python -m screen_activity_logger.cli 録画.mp4 -o out/
 ```
@@ -261,12 +295,12 @@ uv run python -m screen_activity_logger.cli 録画.mp4 -o out/
 
 - Python 3.12（venvは `uv venv -p 3.12`）
 - ffmpeg（フレーム抽出・音声抽出・ffprobe）
-- Ollama 0.30以降（qwen3-vl:8b）または vllm-mlx
+- Ollama 0.30以降（qwen3-vl:8b）または vllm-mlx（ローカルVLM利用時）。Gemini / AnthropicはAPIキーと外部送信許可が必要
 - 主要依存: `paddleocr`+`paddlepaddle`（CPU）, `ollama`, `httpx`, `pillow`, （ASR時）whisper.cpp（brew）または `faster-whisper`
 
 ### 初回モデルダウンロード（合計 約8GB・一度きり・無料）
 
-推論はすべてローカルで動くため、**初回にモデルの取得が必要**（以降はオフラインで動作、API課金なし）:
+ローカルプロバイダを使う場合は、**初回にモデルの取得が必要**（以降はオフラインで動作、API課金なし）:
 
 | モデル | 役割 | サイズ | 取得 |
 |---|---|---|---|
@@ -284,7 +318,9 @@ uv run python -m screen_activity_logger.cli 録画.mp4 -o out/
 `ocr`/`speech` は一次情報を無加工で保持する（検索・監査価値のため）。機密画面を含む
 録画の出力は通常のファイルと同様にアクセス制御下で管理すること。
 
-画面録画にはパスワードや個人情報が含まれ得る。本ツールは完全ローカルで動作するが、実録画（`*.mp4`）や生成ログはリポジトリに含めない（`.gitignore` で除外済み）。保存先の暗号化も検討すること。
+画面録画にはパスワードや個人情報が含まれ得る。ローカルプロバイダを使う場合は
+実録画（`*.mp4`）や生成ログをリポジトリに含めない（`.gitignore` で除外済み）。
+クラウドプロバイダを使う場合は、送信先の利用規約・保持設定・顧客許諾を別途確認すること。
 
 ## ライセンス
 

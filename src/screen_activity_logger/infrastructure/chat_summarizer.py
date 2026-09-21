@@ -7,6 +7,12 @@ VLMと同一サーバー・同一モデルを使うため追加メモリはゼ�
 
 from __future__ import annotations
 
+from screen_activity_logger.infrastructure.vlm_common import (
+    build_anthropic_headers,
+    build_auth_headers,
+    extract_anthropic_text,
+)
+
 # Q4検証済みの文言（誤認識前提・捏造禁止・40字・要約文のみ）を変えないこと
 SUMMARY_PROMPT = (
     "以下はオンライン会議の音声認識テキストの断片です（誤認識を含む）。"
@@ -39,24 +45,26 @@ def _normalize(content) -> str | None:
 
 
 class OpenAIChatSummarizer:
-    """OpenAI互換API（vllm-mlx等）で発話要旨を生成する。"""
+    """OpenAI互換API（vllm-mlx/Gemini等）で発話要旨を生成する。"""
 
     def __init__(
         self,
         model: str,
         base_url: str = "http://localhost:8991/v1",
         timeout_seconds: float = DEFAULT_SUMMARY_TIMEOUT_SECONDS,
+        api_key: str | None = None,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        # describerと同じくクラウド互換エンドポイント向け認証ヘッダ
+        self._headers = build_auth_headers(api_key)
 
     def summarize(self, lines: tuple[str, ...]) -> str | None:
         import httpx  # 遅延import（既存依存）
 
-        response = httpx.post(
-            f"{self._base_url}/chat/completions",
-            json={
+        kwargs: dict = {
+            "json": {
                 "model": self._model,
                 "messages": [
                     {"role": "user", "content": build_summary_prompt(lines)}
@@ -64,11 +72,54 @@ class OpenAIChatSummarizer:
                 "temperature": 0,
                 "max_tokens": _MAX_TOKENS,
             },
-            timeout=self._timeout_seconds,
-        )
+            "timeout": self._timeout_seconds,
+        }
+        if self._headers:
+            kwargs["headers"] = self._headers
+        response = httpx.post(f"{self._base_url}/chat/completions", **kwargs)
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         return _normalize(content)
+
+
+class AnthropicChatSummarizer:
+    """Anthropic Messages APIで発話要旨を生成する。"""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str = "https://api.anthropic.com/v1",
+        timeout_seconds: float = DEFAULT_SUMMARY_TIMEOUT_SECONDS,
+        api_key: str | None = None,
+    ) -> None:
+        if not api_key:
+            raise ValueError("Anthropic APIキーが必要です")
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+        self._headers = build_anthropic_headers(api_key)
+
+    def summarize(self, lines: tuple[str, ...]) -> str | None:
+        import httpx  # 遅延import
+
+        response = httpx.post(
+            f"{self._base_url}/messages",
+            json={
+                "model": self._model,
+                "max_tokens": _MAX_TOKENS,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": build_summary_prompt(lines),
+                    }
+                ],
+            },
+            headers=self._headers,
+            timeout=self._timeout_seconds,
+        )
+        response.raise_for_status()
+        return _normalize(extract_anthropic_text(response.json()))
 
 
 class OllamaChatSummarizer:

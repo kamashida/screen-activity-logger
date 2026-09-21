@@ -9,6 +9,7 @@ dist/
 venv/
 env/
 .python-version
+.pytest-tmp*/
 
 # --- 環境・秘密情報 ---
 .env
@@ -42,3 +43,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- PoC成果物（スクショに業務情報を含むためコミット禁止） ---
+poc_out*/

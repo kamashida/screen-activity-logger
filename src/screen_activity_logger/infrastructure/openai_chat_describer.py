@@ -21,6 +21,7 @@ from screen_activity_logger.infrastructure.vlm_common import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_ATTEMPTS,
     SLOW_CALL_THRESHOLD_SECONDS,
+    build_auth_headers,
     build_prompt,
     is_retryable,
     parse_fields,
@@ -40,16 +41,23 @@ class OpenAIChatSceneDescriber:
         model: str = DEFAULT_VLLM_MODEL,
         base_url: str = DEFAULT_VLLM_URL,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        api_key: str | None = None,
+        warmup: bool = True,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._warmed = False
+        self._warmup_enabled = warmup
+        # クラウド互換エンドポイント（Gemini/Anthropic互換層）向け認証ヘッダ。
+        # 未指定なら既存のヘッダなし動作を維持する
+        self._headers = build_auth_headers(api_key)
 
     def describe(
         self, frame: Frame, ocr: OcrText, speech: tuple[str, ...] = ()
     ) -> ActivityDescription:
-        self._ensure_warm()
+        if self._warmup_enabled:
+            self._ensure_warm()
         image_b64 = base64.b64encode(Path(frame.path).read_bytes()).decode()
         payload = {
             "model": self._model,
@@ -144,10 +152,9 @@ class OpenAIChatSceneDescriber:
     def _post_chat(self, payload: dict[str, Any]) -> str:
         import httpx  # 遅延import（直接依存として宣言済み、4AIレビューR1）
 
-        response = httpx.post(
-            f"{self._base_url}/chat/completions",
-            json=payload,
-            timeout=self._timeout_seconds,
-        )
+        kwargs: dict[str, Any] = {"json": payload, "timeout": self._timeout_seconds}
+        if self._headers:
+            kwargs["headers"] = self._headers
+        response = httpx.post(f"{self._base_url}/chat/completions", **kwargs)
         response.raise_for_status()
         return str(response.json()["choices"][0]["message"]["content"])

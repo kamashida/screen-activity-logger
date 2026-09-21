@@ -2,6 +2,7 @@
 
 import pytest
 
+import screen_activity_logger.infrastructure.asr_factory as asr_factory
 from screen_activity_logger.infrastructure.asr_factory import (
     create_transcriber,
     default_model_for,
@@ -66,7 +67,22 @@ class TestEnsureBackendAvailable:
         monkeypatch.setattr(
             "importlib.util.find_spec", lambda name: object()
         )
+        monkeypatch.setitem(
+            asr_factory._BACKEND_IMPORTERS, "faster", lambda: None
+        )
         ensure_backend_available("faster")  # 例外が出ないこと
+
+    def test_import_failure_is_reported_as_unusable_backend(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "importlib.util.find_spec", lambda name: object()
+        )
+
+        def failing_import() -> None:
+            raise OSError("DLL load failed")
+
+        monkeypatch.setitem(asr_factory._BACKEND_IMPORTERS, "faster", failing_import)
+        with pytest.raises(ValueError, match="読み込めません.*DLL load failed"):
+            ensure_backend_available("faster")
 
     def test_missing_backend_raises_with_install_hint(self, monkeypatch) -> None:
         monkeypatch.setattr("importlib.util.find_spec", lambda name: None)

@@ -5,6 +5,9 @@ import pytest
 from screen_activity_logger.infrastructure.ollama_describer import (
     OllamaSceneDescriber,
 )
+from screen_activity_logger.infrastructure.anthropic_messages_describer import (
+    AnthropicMessagesSceneDescriber,
+)
 from screen_activity_logger.infrastructure.openai_chat_describer import (
     DEFAULT_VLLM_MODEL,
     OpenAIChatSceneDescriber,
@@ -38,6 +41,30 @@ class TestCreateDescriber:
     def test_unknown_backend_raises(self) -> None:
         with pytest.raises(ValueError):
             create_describer("unknown", "m")
+
+    def test_gemini_uses_openai_compat_adapter_without_warmup(self) -> None:
+        describer = create_describer(
+            "ollama", "gemini-test", provider="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            api_key="secret",
+        )
+        assert isinstance(describer, OpenAIChatSceneDescriber)
+        assert describer._warmup_enabled is False
+
+    def test_anthropic_uses_messages_adapter(self) -> None:
+        describer = create_describer(
+            "ollama", "claude-test", provider="anthropic", api_key="secret"
+        )
+        assert isinstance(describer, AnthropicMessagesSceneDescriber)
+        assert describer._base_url == "https://api.anthropic.com/v1"
+
+    def test_gemini_uses_provider_default_url(self) -> None:
+        describer = create_describer(
+            "ollama", "gemini-test", provider="gemini", api_key="secret"
+        )
+        assert describer._base_url == (
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        )
 
 
 class TestEnsureBackendAvailable:
@@ -90,10 +117,127 @@ class TestEnsureBackendAvailable:
 
     def test_reachable_vllm_passes(self, monkeypatch) -> None:
         class OkResponse:
+            status_code = 200
+
             def raise_for_status(self): ...
 
-        monkeypatch.setattr("httpx.get", lambda url, timeout=None: OkResponse())
+        monkeypatch.setattr(
+            "httpx.get", lambda url, timeout=None, headers=None: OkResponse()
+        )
         ensure_backend_available("vllm-mlx")
+
+    def test_api_key_adds_authorization_header(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        class OkResponse:
+            status_code = 200
+
+            def raise_for_status(self): ...
+
+        def fake_get(url, timeout=None, headers=None):
+            calls.append({"headers": headers})
+            return OkResponse()
+
+        monkeypatch.setattr("httpx.get", fake_get)
+        ensure_backend_available("vllm-mlx", api_key="secret-key")
+
+        (call,) = calls
+        assert call["headers"] == {"Authorization": "Bearer secret-key"}
+
+    def test_vllm_404_is_not_treated_as_reachable_with_api_key(
+        self, monkeypatch
+    ) -> None:
+        class NotFoundResponse:
+            status_code = 404
+
+            def raise_for_status(self):
+                raise RuntimeError("404 Not Found")
+
+        monkeypatch.setattr(
+            "httpx.get", lambda url, timeout=None, headers=None: NotFoundResponse()
+        )
+        with pytest.raises(ValueError):
+            ensure_backend_available("vllm-mlx", api_key="secret-key")
+
+    def test_cloud_endpoint_401_raises_with_api_key(self, monkeypatch) -> None:
+        class UnauthorizedResponse:
+            status_code = 401
+
+            def raise_for_status(self):
+                raise RuntimeError("401 Unauthorized")
+
+        monkeypatch.setattr(
+            "httpx.get", lambda url, timeout=None, headers=None: UnauthorizedResponse()
+        )
+        with pytest.raises(ValueError):
+            ensure_backend_available("vllm-mlx", api_key="secret-key")
+
+    def _gemini_preflight(self, monkeypatch, status_code: int) -> None:
+        """指定ステータスを返すモックでgemini事前チェックを実行するヘルパー。"""
+        import httpx
+
+        class FakeResponse:
+            def __init__(self, code: int) -> None:
+                self.status_code = code
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None, headers=None: FakeResponse(status_code),
+        )
+        from screen_activity_logger.infrastructure.vlm_factory import (
+            ensure_provider_available,
+        )
+
+        ensure_provider_available(
+            "ollama", "https://example.com/v1/openapi", "secret-key",
+            provider="gemini", model="google/gemini-2.5-flash", allow_external=True,
+        )
+
+    def test_gemini_preflight_allows_404_model_info(self, monkeypatch) -> None:
+        # Vertex AI openapiエンドポイントは/models/<model>未実装で404を返すが
+        # chat/completionsは動くため、404だけは本呼び出しに委ねる
+        self._gemini_preflight(monkeypatch, 404)  # 例外が出ないこと
+
+    def test_gemini_preflight_rejects_500(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 500)
+
+    def test_gemini_preflight_rejects_429(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 429)
+
+    def test_gemini_preflight_rejects_401(self, monkeypatch) -> None:
+        with pytest.raises(ValueError):
+            self._gemini_preflight(monkeypatch, 401)
+
+    def test_anthropic_preflight_does_not_make_models_request(self, monkeypatch) -> None:
+        def fail_get(*args, **kwargs):
+            raise AssertionError("Anthropic preflight must not call /models")
+
+        monkeypatch.setattr("httpx.get", fail_get)
+        from screen_activity_logger.infrastructure.vlm_factory import (
+            ensure_provider_available,
+        )
+
+        ensure_provider_available(
+            "ollama", "https://api.anthropic.com/v1", "secret-key",
+            provider="anthropic", model="claude-test", allow_external=True,
+        )
+
+    def test_external_provider_requires_explicit_allowance(self) -> None:
+        from screen_activity_logger.infrastructure.vlm_factory import (
+            ensure_provider_available,
+        )
+
+        with pytest.raises(ValueError, match="allow-external-vlm"):
+            ensure_provider_available(
+                "ollama", "https://api.anthropic.com/v1", "secret-key",
+                provider="anthropic", model="claude-test",
+            )
 
 
 class TestCreateSummarizer:

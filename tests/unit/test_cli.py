@@ -10,10 +10,25 @@ from screen_activity_logger.infrastructure.ffmpeg_extractor import (
 from screen_activity_logger.infrastructure.ollama_describer import (
     OllamaSceneDescriber,
 )
+from screen_activity_logger.infrastructure.ocr_only_describer import (
+    OcrOnlySceneDescriber,
+)
 from screen_activity_logger.infrastructure.paddle_ocr import PaddleOcrRecognizer
 
 
 class TestBuildUseCase:
+    def test_wires_explicit_no_vlm_baseline(self, tmp_path: Path) -> None:
+        use_case = build_use_case(
+            fps=0.5,
+            scene_threshold=0.08,
+            model="qwen3-vl:8b",
+            ocr_tolerance_seconds=2.0,
+            workdir=tmp_path,
+            no_vlm=True,
+        )
+
+        assert isinstance(use_case.scene_describer, OcrOnlySceneDescriber)
+
     def test_wires_all_adapters_with_config(self, tmp_path: Path) -> None:
         use_case = build_use_case(
             fps=0.5,
@@ -291,3 +306,256 @@ class TestVlmBackendWiring:
             workdir=tmp_path,
         )
         assert isinstance(use_case.scene_describer, OllamaSceneDescriber)
+
+    def test_vlm_api_key_is_wired_to_describer(self, tmp_path: Path) -> None:
+        """クラウドVLM対応: vlm_api_keyがdescriber/summarizerの認証ヘッダに届く。"""
+        use_case = build_use_case(
+            fps=0.5,
+            scene_threshold=0.08,
+            model="qwen3-vl:8b",
+            ocr_tolerance_seconds=2.0,
+            workdir=tmp_path,
+            vlm_backend="vllm-mlx",
+            vlm_url="http://localhost:9000/v1",
+            vlm_api_key="secret-key",
+        )
+        assert use_case.scene_describer._headers == {
+            "Authorization": "Bearer secret-key"
+        }
+
+    def test_no_vlm_api_key_means_no_headers(self, tmp_path: Path) -> None:
+        use_case = build_use_case(
+            fps=0.5,
+            scene_threshold=0.08,
+            model="qwen3-vl:8b",
+            ocr_tolerance_seconds=2.0,
+            workdir=tmp_path,
+            vlm_backend="vllm-mlx",
+            vlm_url="http://localhost:9000/v1",
+        )
+        assert use_case.scene_describer._headers is None
+
+
+class TestVlmApiKeyCliWiring:
+    """自社dogfood改造: --vlm-api-key-env / 外部URL警告のCLI組み立て検証。
+
+    main()の重い動画処理には踏み込まず、ensure_vlm_availableをフックして
+    引数検証・警告出力までの配線だけを検証する（ダミー動画ファイル使用）。
+    """
+
+    def _video(self, tmp_path: Path) -> Path:
+        video = tmp_path / "in.mp4"
+        video.write_bytes(b"0")
+        return video
+
+    def test_missing_env_var_errors(self, tmp_path: Path, capsys) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_UNSET_KEY_XYZ",
+            ])
+        assert "SAL_TEST_UNSET_KEY_XYZ" in capsys.readouterr().err
+
+    def test_no_vlm_rejects_cloud_configuration(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--no-vlm",
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_KEY_XYZ",
+            ])
+        assert "--no-vlm" in capsys.readouterr().err
+
+    def test_empty_env_var_errors(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        monkeypatch.setenv("SAL_TEST_EMPTY_KEY_XYZ", "")
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_EMPTY_KEY_XYZ",
+            ])
+        assert "SAL_TEST_EMPTY_KEY_XYZ" in capsys.readouterr().err
+
+    def test_cloud_provider_requires_explicit_model(self, tmp_path: Path, capsys) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--vlm-api-key-env", "SAL_TEST_CLOUD_KEY_XYZ",
+            ])
+        assert "--model" in capsys.readouterr().err
+
+    def test_cloud_provider_requires_api_key_env(self, tmp_path: Path, capsys) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+            ])
+        assert "--vlm-api-key-env" in capsys.readouterr().err
+
+    def test_external_vlm_requires_explicit_allow(self, tmp_path: Path, capsys) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_EXTERNAL_KEY_XYZ",
+            ])
+        assert "--allow-external-vlm" in capsys.readouterr().err
+
+    def test_cloud_provider_configuration_reaches_preflight(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        monkeypatch.setenv("SAL_TEST_GEMINI_KEY_XYZ", "secret123")
+        captured: dict = {}
+
+        def fake_ensure(backend, url, api_key=None, **kwargs):
+            captured.update(
+                {
+                    "backend": backend,
+                    "url": url,
+                    "api_key": api_key,
+                    **kwargs,
+                }
+            )
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_GEMINI_KEY_XYZ",
+                "--allow-external-vlm",
+            ])
+
+        assert captured == {
+            "backend": "ollama",
+            "url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "api_key": "secret123",
+            "provider": "gemini",
+            "model": "gemini-test",
+            "allow_external": True,
+        }
+
+    def test_local_ollama_rejects_unused_api_key_env(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        import pytest
+
+        from screen_activity_logger.cli import main
+
+        with pytest.raises(SystemExit):
+            main([
+                str(self._video(tmp_path)),
+                "--vlm-api-key-env", "SAL_TEST_LOCAL_KEY_XYZ",
+            ])
+        assert "ローカルollama" in capsys.readouterr().err
+
+    def test_present_env_var_is_passed_to_ensure_vlm_available(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        monkeypatch.setenv("SAL_TEST_KEY_XYZ", "secret123")
+        captured: dict = {}
+
+        def fake_ensure(backend, url, api_key=None, **kwargs):
+            captured["api_key"] = api_key
+            captured["provider"] = kwargs["provider"]
+            captured["model"] = kwargs["model"]
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([
+                str(self._video(tmp_path)),
+                "--vlm-provider", "gemini",
+                "--model", "gemini-test",
+                "--vlm-api-key-env", "SAL_TEST_KEY_XYZ",
+                "--allow-external-vlm",
+            ])
+        assert captured["api_key"] == "secret123"
+        assert captured["provider"] == "gemini"
+        assert captured["model"] == "gemini-test"
+
+    def test_external_vlm_url_prints_warning(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        def fake_ensure(backend, url, api_key=None, **kwargs):
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([
+                str(self._video(tmp_path)),
+                "--vlm-backend", "vllm-mlx",
+                "--vlm-url", "https://generativelanguage.googleapis.com/v1beta/openai",
+                "--allow-external-vlm",
+            ])
+        err = capsys.readouterr().err
+        assert "警告: VLM接続先が外部です" in err
+        assert "generativelanguage.googleapis.com" in err
+
+    def test_localhost_vlm_url_prints_no_warning(
+        self, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import pytest
+
+        import screen_activity_logger.cli as cli_module
+
+        def fake_ensure(backend, url, api_key=None, **kwargs):
+            raise RuntimeError("stop-before-heavy-pipeline")
+
+        monkeypatch.setattr(cli_module, "ensure_vlm_available", fake_ensure)
+
+        with pytest.raises(RuntimeError):
+            cli_module.main([str(self._video(tmp_path))])
+        assert "警告" not in capsys.readouterr().err

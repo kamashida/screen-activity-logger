@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import tempfile
+from urllib.parse import urlsplit
 from pathlib import Path
 
 from screen_activity_logger.application.use_cases import (
@@ -40,13 +43,22 @@ from screen_activity_logger.infrastructure.mlx_whisper_transcriber import (
 from screen_activity_logger.infrastructure.ollama_describer import (
     DEFAULT_TIMEOUT_SECONDS,
 )
+from screen_activity_logger.infrastructure.ocr_only_describer import (
+    OcrOnlySceneDescriber,
+)
 from screen_activity_logger.infrastructure.openai_chat_describer import (
     DEFAULT_VLLM_URL,
 )
 from screen_activity_logger.infrastructure.vlm_factory import (
     create_describer,
     create_summarizer,
-    ensure_backend_available as ensure_vlm_available,
+    DEFAULT_ANTHROPIC_URL,
+    DEFAULT_GEMINI_URL,
+    ensure_provider_available as ensure_vlm_available,
+)
+from screen_activity_logger.infrastructure.vlm_common import (
+    is_local_url,
+    validate_vlm_url,
 )
 from screen_activity_logger.infrastructure.paddle_ocr import PaddleOcrRecognizer
 from screen_activity_logger.infrastructure.manual_writer import (
@@ -84,8 +96,11 @@ def build_use_case(
     vlm_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     speaker_attribution: SpeakerAttributionConfig | None = None,
     vlm_backend: str = "ollama",
-    vlm_url: str = DEFAULT_VLLM_URL,
+    vlm_url: str | None = None,
     speech_summary: bool = False,
+    vlm_api_key: str | None = None,
+    vlm_provider: str = "local",
+    no_vlm: bool = False,
 ) -> GenerateWorklog:
     """設定値から全アダプタを組み立てたユースケースを返す。
 
@@ -95,15 +110,20 @@ def build_use_case(
     speech_filter: ASR幻覚フィルタ（Noneで無効。CLI経由では既定ON）。
     asr_backend: 解決済みバックエンド（cpp/faster/mlx。既定faster）。
     """
+    scene_describer = (
+        OcrOnlySceneDescriber()
+        if no_vlm
+        else create_describer(
+            vlm_backend, model, timeout_seconds=vlm_timeout_seconds,
+            base_url=vlm_url, api_key=vlm_api_key, provider=vlm_provider,
+        )
+    )
     return GenerateWorklog(
         frame_extractor=FfmpegFrameExtractor(
             fps=fps, scene_threshold=scene_threshold, workdir=workdir
         ),
         text_recognizer=PaddleOcrRecognizer(tier=ocr_tier),
-        scene_describer=create_describer(
-            vlm_backend, model, timeout_seconds=vlm_timeout_seconds,
-            base_url=vlm_url,
-        ),
+        scene_describer=scene_describer,
         merger=TimelineMerger(ocr_match_tolerance_seconds=ocr_tolerance_seconds),
         frame_comparator=PilFrameComparator(threshold=diff_threshold),
         speech_transcriber=(
@@ -123,7 +143,8 @@ def build_use_case(
         speech_summarizer=(
             create_summarizer(
                 vlm_backend, model, base_url=vlm_url,
-                timeout_seconds=vlm_timeout_seconds,
+                timeout_seconds=vlm_timeout_seconds, api_key=vlm_api_key,
+                provider=vlm_provider,
             )
             if speech_summary
             else None
@@ -148,7 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--scene-threshold", type=float, default=DEFAULT_SCENE_THRESHOLD
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model", default=None,
+        help="VLMモデル名（ローカル既定: qwen3-vl:8b。クラウドは明示必須）",
+    )
     parser.add_argument(
         "--ocr-tolerance", type=float, default=DEFAULT_OCR_TOLERANCE_SECONDS
     )
@@ -201,15 +225,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--vlm-backend", choices=["ollama", "vllm-mlx"], default="ollama",
-        help="VLMバックエンド（vllm-mlxは実測約40倍高速・要サーバー起動、既定: ollama）",
+        help="ローカルVLMバックエンド（既定: ollama。クラウドでは無視）",
     )
     parser.add_argument(
-        "--vlm-url", default=DEFAULT_VLLM_URL,
-        help=f"vllm-mlxサーバーURL（既定: {DEFAULT_VLLM_URL}）",
+        "--vlm-provider", choices=["local", "gemini", "anthropic"], default="local",
+        help="VLMプロバイダ（local/gemini/anthropic、既定: local）",
+    )
+    parser.add_argument(
+        "--vlm-url", default=None,
+        help="VLM接続先URL（省略時はプロバイダ既定。外部はHTTPS＋明示許可必須）",
     )
     parser.add_argument(
         "--vlm-timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
         help="VLM呼び出しの試行毎タイムアウト秒（タイムアウト時は1回リトライ、既定: 300）",
+    )
+    parser.add_argument(
+        "--vlm-api-key-env", default=None,
+        help="クラウドVLM認証用APIキーを保持する環境変数名（キー値は引数に渡さない）",
+    )
+    parser.add_argument(
+        "--allow-external-vlm", action="store_true",
+        help="画面フレームを外部VLMへ送信することを明示許可する",
+    )
+    parser.add_argument(
+        "--no-vlm", action="store_true",
+        help="VLMを使わずOCR/ASRのみで基線ログを生成する（外部送信なし）",
     )
     parser.add_argument(
         "--format", choices=["worklog", "manual"], default="worklog",
@@ -281,10 +321,91 @@ def main(argv: list[str] | None = None) -> int:
                 f"{binary} が見つかりません。README「動作要件」に従い導入してください"
             )
 
-    try:
-        ensure_vlm_available(args.vlm_backend, args.vlm_url)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if args.no_vlm:
+        if args.speech_summary:
+            parser.error("--no-vlm では --speech-summary は使用できません")
+        if (
+            args.vlm_provider != "local"
+            or args.vlm_url
+            or args.vlm_api_key_env
+            or args.allow_external_vlm
+        ):
+            parser.error(
+                "--no-vlm とVLM接続設定は併用できません。"
+                " VLM設定を外すか、--no-vlmを外してください"
+            )
+
+    # VLMプロバイダごとのモデル・URLを確定する。クラウドはモデルを
+    # 明示させ、時点依存のモデル名を暗黙に選ばない。
+    vlm_model = args.model or (
+        DEFAULT_MODEL if args.no_vlm or args.vlm_provider == "local" else None
+    )
+    if not vlm_model:
+        parser.error("クラウドVLMでは --model を明示してください")
+    if args.no_vlm:
+        vlm_url = DEFAULT_VLLM_URL
+        vlm_api_key = None
+    else:
+        if args.vlm_provider == "gemini":
+            vlm_url = args.vlm_url or DEFAULT_GEMINI_URL
+        elif args.vlm_provider == "anthropic":
+            vlm_url = args.vlm_url or DEFAULT_ANTHROPIC_URL
+        elif args.vlm_backend == "vllm-mlx":
+            vlm_url = args.vlm_url or DEFAULT_VLLM_URL
+        else:
+            if args.vlm_url:
+                parser.error("--vlm-backend ollamaでは --vlm-url は使用しません")
+            vlm_url = DEFAULT_VLLM_URL
+
+        # APIキーは値自体をCLI引数で受け取らず、プロセス一覧への漏洩を防ぐ。
+        # クラウドでは環境変数名も必須にして、無認証送信を防止する。
+        vlm_api_key = None
+        if args.vlm_provider != "local" and not args.vlm_api_key_env:
+            parser.error("クラウドVLMでは --vlm-api-key-env が必須です")
+        if args.vlm_api_key_env:
+            if args.vlm_provider == "local" and args.vlm_backend == "ollama":
+                parser.error(
+                    "--vlm-api-key-env はローカルollamaでは使用しません。"
+                    " クラウドVLMまたは --vlm-backend vllm-mlx を指定してください"
+                )
+            vlm_api_key = os.environ.get(args.vlm_api_key_env)
+            if not vlm_api_key:
+                parser.error(
+                    f"環境変数 {args.vlm_api_key_env} が未設定または空です。"
+                    " --vlm-api-key-env で指定した環境変数にAPIキーを設定してください"
+                )
+
+    # ループバック以外への接続はフレーム画像が外部送信されるため、
+    # HTTPS＋明示許可を要求する。
+    if args.no_vlm:
+        external_vlm = False
+    elif args.vlm_provider == "local" and args.vlm_backend == "ollama":
+        external_vlm = False
+    else:
+        try:
+            validate_vlm_url(vlm_url, allow_external=args.allow_external_vlm)
+        except ValueError as exc:
+            parser.error(str(exc))
+        external_vlm = not is_local_url(vlm_url)
+    vlm_host = urlsplit(vlm_url).hostname or vlm_url
+    if external_vlm:
+        print(
+            f"警告: VLM接続先が外部です（{vlm_host}）。フレーム画像が外部に送信されます",
+            file=sys.stderr,
+        )
+
+    if not args.no_vlm:
+        try:
+            ensure_vlm_available(
+                args.vlm_backend,
+                vlm_url,
+                api_key=vlm_api_key,
+                provider=args.vlm_provider,
+                model=vlm_model,
+                allow_external=args.allow_external_vlm,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     asr_backend = resolve_backend(args.asr_backend)
     asr_model: str | None = (
         None if args.no_asr else (args.asr_model or default_model_for(asr_backend))
@@ -314,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         use_case = build_use_case(
             fps=args.fps,
             scene_threshold=args.scene_threshold,
-            model=args.model,
+            model=vlm_model,
             ocr_tolerance_seconds=args.ocr_tolerance,
             workdir=Path(tmp),
             ocr_tier=args.ocr_tier,
@@ -327,7 +448,10 @@ def main(argv: list[str] | None = None) -> int:
             asr_workers=args.asr_workers or None,
             vlm_timeout_seconds=args.vlm_timeout,
             vlm_backend=args.vlm_backend,
-            vlm_url=args.vlm_url,
+            vlm_url=vlm_url,
+            vlm_api_key=vlm_api_key,
+            vlm_provider=args.vlm_provider,
+            no_vlm=args.no_vlm,
             speech_summary=args.speech_summary,
             # バッチは動画毎サブディレクトリ配下に frames/ を置くため単発のみここで指定
             frame_export_dir=(
